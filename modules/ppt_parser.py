@@ -1,77 +1,159 @@
-"""
-Module to parse employee engagement survey PPT and extract data
-"""
-from pptx import Presentation
 import re
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-def parse_ppt(uploaded_file):
-    """
-    Parse the uploaded engagement survey PPT and extract key data
-    
-    Args:
-        uploaded_file: The uploaded PPT file from Streamlit
-    
-    Returns:
-        dict: Extracted data including department, scores, etc.
-    """
-    
+
+def _safe_text(shape):
+    try:
+        return shape.text.strip()
+    except Exception:
+        return ""
+
+
+def _extract_number(text, default=0):
+    m = re.search(r"-?\d+", str(text))
+    return int(m.group()) if m else default
+
+
+def _split_question(text):
+    parts = [p.strip() for p in text.split("|", 1)]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return text.strip(), text.strip()
+
+
+def parse_survey_ppt(uploaded_file):
     prs = Presentation(uploaded_file)
-    
+
     data = {
-        'department': 'Unknown Department',
-        'overall_score': 0,
-        'total_participants': 0,
-        'all_scores': [],
-        'lowest_scores': [],
-        'lowest_items': [],
-        'highest_scores': [],
-        'highest_items': [],
-        'survey_date': 'October 2025',
-        'raw_text': [],  # Store all text for better analysis
+        "department": "Unknown Team",
+        "survey_month": "Oct 2025",
+        "overall_score": 0,
+        "company_score": 0,
+        "change_vs_last": 0,
+        "responded_count": 0,
+        "question_count": 0,
+        "strengths": [],
+        "opportunities": [],
+        "score_rows": [],
+        "bottom_10": [],
     }
-    
-    # Extract all text from slides
-    for slide_idx, slide in enumerate(prs.slides):
-        slide_text = []
-        for shape in slide.shapes:
-            if hasattr(shape, 'text') and shape.text.strip():
-                text = shape.text.strip()
-                slide_text.append(text)
-                data['raw_text'].append(text)
-        
-        # Try to identify department from slide text
-        slide_combined = ' '.join(slide_text)
-        
-        # Extract department name
-        if 'Marine' in slide_combined or 'Service' in slide_combined:
-            for text in slide_text:
-                if 'Marine' in text or 'Service' in text:
-                    data['department'] = text
+
+    # -------- Slide 2: department / metadata --------
+    if len(prs.slides) >= 2:
+        slide2 = prs.slides[1]
+        for shape in slide2.shapes:
+            txt = _safe_text(shape)
+            if "Manager:" in txt:
+                lines = [x.strip() for x in txt.splitlines() if x.strip()]
+                if len(lines) >= 2:
+                    data["department"] = lines[-1]
+                else:
+                    if "|" in txt:
+                        data["department"] = txt.split("|")[-1].strip()
+
+            if "Questions" in txt:
+                q = re.search(r"(\d+)\s*/\s*(\d+)\s*Questions", txt, re.I)
+                if q:
+                    data["question_count"] = int(q.group(1))
+
+            if "October 2025" in txt:
+                data["survey_month"] = "Oct 2025"
+
+    # -------- Slide 3: overview --------
+    if len(prs.slides) >= 3:
+        slide3 = prs.slides[2]
+        for shape in slide3.shapes:
+            txt = _safe_text(shape)
+            name = getattr(shape, "name", "")
+
+            if name == "Score value" or txt.isdigit():
+                if int(txt) <= 100:
+                    data["overall_score"] = int(txt)
                     break
-        
-        # Extract all percentage values
-        for text in slide_text:
-            matches = re.findall(r'(\d+)\s*%', text)
-            if matches:
-                for match in matches:
-                    score = int(match)
-                    if 0 <= score <= 100:
-                        data['all_scores'].append(score)
-        
-        # Extract participant count
-        participant_match = re.search(r'(\d+)\s*(?:respondent|participant|people|person)', slide_combined, re.IGNORECASE)
-        if participant_match:
-            data['total_participants'] = int(participant_match.group(1))
-    
-    # Calculate statistics
-    if data['all_scores']:
-        data['overall_score'] = sum(data['all_scores']) / len(data['all_scores'])
-        
-        # Get 10 lowest scores
-        sorted_scores = sorted(data['all_scores'])
-        data['lowest_scores'] = sorted_scores[:min(10, len(sorted_scores))]
-        
-        # Get 3 highest scores
-        data['highest_scores'] = sorted_scores[-3:][::-1]
-    
+
+        for shape in slide3.shapes:
+            txt = _safe_text(shape)
+            name = getattr(shape, "name", "")
+
+            if name == "Comparison value":
+                data["company_score"] = _extract_number(txt)
+
+            if name == "Change value":
+                data["change_vs_last"] = _extract_number(txt)
+
+            if "Responded in" in txt:
+                m = re.search(r"(\d+)\s*\(", txt)
+                if m:
+                    data["responded_count"] = int(m.group(1))
+
+    # -------- Slide 4: strengths & opportunities --------
+    if len(prs.slides) >= 4:
+        slide4 = prs.slides[3]
+        for shape in slide4.shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP and "Report section group" in shape.name:
+                try:
+                    drivers_group = shape.shapes[0]  # Drivers group
+                    driver_groups = list(drivers_group.shapes)
+
+                    for i, dg in enumerate(driver_groups):
+                        txt = _safe_text(dg.shapes[0])
+                        impact = _safe_text(dg.shapes[1]) if len(dg.shapes) > 1 else ""
+                        title, statement = _split_question(txt)
+                        title = re.sub(r"\d+$", "", title).strip()
+
+                        item = {
+                            "title": title,
+                            "statement": statement,
+                            "impact": impact,
+                        }
+
+                        if i < 3:
+                            data["strengths"].append(item)
+                        else:
+                            data["opportunities"].append(item)
+                except Exception:
+                    pass
+
+    # -------- Slides 5-12: score table --------
+    for slide in prs.slides:
+        title_texts = [_safe_text(s) for s in slide.shapes if _safe_text(s)]
+        if not any(t.startswith("Scores") for t in title_texts):
+            continue
+
+        for shape in slide.shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP and "Report section group" in shape.name:
+                try:
+                    table_body = shape.shapes[1]  # Table body group
+                    for row_group in table_body.shapes:
+                        score = _extract_number(_safe_text(row_group.shapes[0]), 0)
+                        question_text = _safe_text(row_group.shapes[1])
+                        vs_company = _safe_text(row_group.shapes[2])
+                        change = _safe_text(row_group.shapes[3])
+                        impact = _safe_text(row_group.shapes[4])
+                        comments = _safe_text(row_group.shapes[5]) if len(row_group.shapes) > 5 else "--"
+
+                        driver, statement = _split_question(question_text)
+
+                        row = {
+                            "score": score,
+                            "driver": driver.strip(),
+                            "statement": statement.strip(),
+                            "question": question_text.strip(),
+                            "vs_company": vs_company.strip(),
+                            "change": change.strip(),
+                            "impact": impact.strip(),
+                            "comments": comments.strip(),
+                        }
+                        data["score_rows"].append(row)
+                except Exception:
+                    pass
+
+    # -------- bottom 10 --------
+    data["score_rows"] = [r for r in data["score_rows"] if r["score"] > 0]
+    data["bottom_10"] = sorted(
+        data["score_rows"],
+        key=lambda x: (x["score"], x["driver"].lower())
+    )[:10]
+
     return data
